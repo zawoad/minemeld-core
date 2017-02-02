@@ -132,11 +132,9 @@ class ExportList(basepoller.BasePollerFT):
 
     def _build_iterator(self, now):
         if self.api_key is None or self.label is None:
-            LOG.info(
-                '%s - api_key or label not set, poll not performed',
-                self.name
+            raise RuntimeError(
+                '%s - api_key or label not set, poll not performed' % self.name
             )
-            return []
 
         body = {
             'label': self.label,
@@ -158,3 +156,21 @@ class ExportList(basepoller.BasePollerFT):
         LOG.info('%s - hup received, reload side config', self.name)
         self._load_side_config()
         super(ExportList, self).hup(source=source)
+
+    @staticmethod
+    def gc(name, config=None):
+        basepoller.BasePollerFT.gc(name, config=config)
+
+        side_config_path = None
+        if config is not None:
+            side_config_path = config.get('side_config', None)
+        if side_config_path is None:
+            side_config_path = os.path.join(
+                os.environ['MM_CONFIG_DIR'],
+                '{}_side_config.yml'.format(name)
+            )
+
+        try:
+            os.remove(side_config_path)
+        except:
+            pass

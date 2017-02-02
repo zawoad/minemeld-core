@@ -12,27 +12,26 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-import logging
-
 import uuid
 
-from flask import request
-from flask import jsonify
+from flask import request, jsonify
 
-import flask.ext.login
-
-from . import app
-
-# for hup API
-from . import MMRpcClient
+from . import config
+from .mmrpc import MMRpcClient
+from .jobs import JOBS_MANAGER
+from .aaa import MMBlueprint
+from .logger import LOG
 
 import minemeld.traced
 
-LOG = logging.getLogger(__name__)
+
+__all__ = ['BLUEPRINT']
 
 
-@app.route('/traced/query')
-@flask.ext.login.login_required
+BLUEPRINT = MMBlueprint('traced', __name__, url_prefix='/traced')
+
+
+@BLUEPRINT.route('/query', read_write=False)
 def traced_query():
     query_uuid = request.args.get('uuid', None)
     if query_uuid is None:
@@ -65,7 +64,7 @@ def traced_query():
 
     query = request.args.get('q', "")
 
-    result = MMRpcClient.send_cmd(minemeld.traced.QUERY_QUEUE, 'query', {
+    result = MMRpcClient.send_raw_cmd(minemeld.traced.QUERY_QUEUE, 'query', {
         'uuid': query_uuid,
         'timestamp': timestamp,
         'counter': counter,
@@ -76,16 +75,36 @@ def traced_query():
     return jsonify(result=result), 200
 
 
-@app.route('/traced/query/<query_uuid>/kill')
-@flask.ext.login.login_required
+@BLUEPRINT.route('/query/<query_uuid>/kill', read_write=False)
 def traced_kill_query(query_uuid):
     try:
         uuid.UUID(query_uuid)
     except ValueError:
         return jsonify(error={'message': 'invalid query UUID'}), 400
 
-    result = MMRpcClient.send_cmd(minemeld.traced.QUERY_QUEUE, 'kill_query', {
+    result = MMRpcClient.send_raw_cmd(minemeld.traced.QUERY_QUEUE, 'kill_query', {
         'uuid': query_uuid
     })
 
     return jsonify(result=result), 200
+
+
+@BLUEPRINT.route('/purge-all', read_write=True)
+def traced_purge_all():
+    traced_purge_path = config.get('MINEMELD_TRACED_PURGE_PATH', None)
+    if traced_purge_path is None:
+        return jsonify(error={'message': 'MINEMELD_TRACED_PURGE_PATH not set'}), 500
+
+    jobs = JOBS_MANAGER.get_jobs(job_group='traced-purge')
+    for jobid, jobdata in jobs.iteritems():
+        if jobdata == 'RUNNING':
+            return jsonify(error={'message': 'a trace purge job is already running'}), 400
+
+    jobid = JOBS_MANAGER.exec_job(
+        job_group='traced-purge',
+        description='purge all traces',
+        args=[traced_purge_path, '--all'],
+        data={}
+    )
+
+    return jsonify(result=jobid)

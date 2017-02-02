@@ -52,7 +52,7 @@ class MineMeldFTRedisTests(unittest.TestCase):
         self.assertEqual(b.output, None)
         self.assertEqual(b.redis_skey, FTNAME)
         self.assertNotEqual(b.SR, None)
-        self.assertEqual(b.redis_host, 'localhost')
+        self.assertEqual(b.redis_host, '127.0.0.1')
         self.assertEqual(b.redis_port, 6379)
         self.assertEqual(b.redis_password, None)
         self.assertEqual(b.redis_db, 0)
@@ -102,8 +102,7 @@ class MineMeldFTRedisTests(unittest.TestCase):
                 'get',
                 'get_all',
                 'get_range',
-                'length',
-                'hup'
+                'length'
             ]
         )
 
@@ -134,12 +133,12 @@ class MineMeldFTRedisTests(unittest.TestCase):
 
         SR = redis.StrictRedis()
 
-        b.update('a', indicator='testi', value={'test': 'v'})
+        b.filtered_update('a', indicator='testi', value={'test': 'v'})
         sm = SR.zrange(FTNAME, 0, -1)
         self.assertEqual(len(sm), 1)
         self.assertIn('testi', sm)
 
-        b.withdraw('a', indicator='testi')
+        b.filtered_withdraw('a', indicator='testi')
         sm = SR.zrange(FTNAME, 0, -1)
         self.assertEqual(len(sm), 0)
 
@@ -169,18 +168,18 @@ class MineMeldFTRedisTests(unittest.TestCase):
         b.start()
         time.sleep(1)
 
-        b.update('a', indicator='testi', value={'test': 'v'})
+        b.filtered_update('a', indicator='testi', value={'test': 'v'})
         self.assertEqual(b.length(), 1)
         status = b.mgmtbus_status()
         self.assertEqual(status['statistics']['added'], 1)
 
-        b.update('a', indicator='testi', value={'test': 'v2'})
+        b.filtered_update('a', indicator='testi', value={'test': 'v2'})
         self.assertEqual(b.length(), 1)
         status = b.mgmtbus_status()
         self.assertEqual(status['statistics']['added'], 1)
         self.assertEqual(status['statistics']['removed'], 0)
 
-        b.withdraw('a', indicator='testi')
+        b.filtered_withdraw('a', indicator='testi')
         self.assertEqual(b.length(), 0)
         status = b.mgmtbus_status()
         self.assertEqual(status['statistics']['removed'], 1)
@@ -212,18 +211,76 @@ class MineMeldFTRedisTests(unittest.TestCase):
 
         SR = redis.StrictRedis()
 
-        b.update('a', indicator='testi', value={'test': 'v'})
+        b.filtered_update('a', indicator='testi', value={'test': 'v'})
         sm = SR.zrange(FTNAME, 0, -1)
         self.assertEqual(len(sm), 1)
         self.assertIn('testi', sm)
         sm = SR.hlen(FTNAME+'.value')
         self.assertEqual(sm, 1)
 
-        b.withdraw('a', indicator='testi')
+        b.filtered_withdraw('a', indicator='testi')
         sm = SR.zrange(FTNAME, 0, -1)
         self.assertEqual(len(sm), 0)
         sm = SR.hlen(FTNAME+'.value')
         self.assertEqual(sm, 0)
+
+        b.stop()
+        self.assertNotEqual(b.SR, None)
+
+    def test_store_value_overflow(self):
+        config = {'store_value': True}
+        chassis = mock.Mock()
+
+        chassis.request_sub_channel.return_value = None
+        ochannel = mock.Mock()
+        chassis.request_pub_channel.return_value = ochannel
+        chassis.request_rpc_channel.return_value = None
+        rpcmock = mock.Mock()
+        rpcmock.get.return_value = {'error': None, 'result': 'OK'}
+        chassis.send_rpc.return_value = rpcmock
+
+        b = minemeld.ft.redis.RedisSet(FTNAME, chassis, config)
+        b.max_entries = 1
+
+        inputs = ['a', 'b', 'c']
+        output = False
+
+        b.connect(inputs, output)
+        b.mgmtbus_reset()
+
+        b.start()
+        time.sleep(1)
+
+        SR = redis.StrictRedis()
+
+        b.filtered_update('a', indicator='testi', value={'test': 'v'})
+        sm = SR.zrange(FTNAME, 0, -1)
+        self.assertEqual(len(sm), 1)
+        self.assertIn('testi', sm)
+        sm = SR.hlen(FTNAME+'.value')
+        self.assertEqual(sm, 1)
+
+        b.filtered_update('a', indicator='testio', value={'test': 'v'})
+        self.assertEqual(b.statistics['drop.overflow'], 1)
+        sm = SR.zrange(FTNAME, 0, -1)
+        self.assertEqual(len(sm), 1)
+        self.assertIn('testi', sm)
+        sm = SR.hlen(FTNAME+'.value')
+        self.assertEqual(sm, 1)
+
+        b.filtered_withdraw('a', indicator='testi')
+        sm = SR.zrange(FTNAME, 0, -1)
+        self.assertEqual(len(sm), 0)
+        sm = SR.hlen(FTNAME+'.value')
+        self.assertEqual(sm, 0)
+
+        b.filtered_update('a', indicator='testio', value={'test': 'v'})
+        self.assertEqual(b.statistics['drop.overflow'], 1)
+        sm = SR.zrange(FTNAME, 0, -1)
+        self.assertEqual(len(sm), 1)
+        self.assertIn('testio', sm)
+        sm = SR.hlen(FTNAME+'.value')
+        self.assertEqual(sm, 1)
 
         b.stop()
         self.assertNotEqual(b.SR, None)

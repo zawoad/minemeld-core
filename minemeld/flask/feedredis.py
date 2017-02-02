@@ -12,27 +12,27 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-import logging
 import re
 import cStringIO
 
-from flask import request
-from flask import jsonify
-from flask import Response
-from flask import stream_with_context
+from flask import request, jsonify, Response, stream_with_context
+from flask.ext.login import current_user
 
-import flask.ext.login
+from .redisclient import SR
+from .mmrpc import MMMaster
+from .aaa import MMBlueprint
+from .logger import LOG
 
-from . import app
-from . import SR
-from . import MMMaster
 
-LOG = logging.getLogger(__name__)
+__all__ = ['BLUEPRINT']
+
+
 FEED_INTERVAL = 100
-
-
 _PROTOCOL_RE = re.compile('^(?:[a-z]+:)*//')
 _INVALID_TOKEN_RE = re.compile('(?:[^\./+=\?&]+\*[^\./+=\?&]*)|(?:[^\./+=\?&]*\*[^\./+=\?&]+)')
+
+
+BLUEPRINT = MMBlueprint('feeds', __name__, url_prefix='/feeds')
 
 
 def generate_panosurl_feed(feed, start, num, desc, value):
@@ -46,9 +46,6 @@ def generate_panosurl_feed(feed, start, num, desc, value):
     cstart = start
 
     while cstart < (start+num):
-        LOG.debug("cstart: %s start+num: %s", cstart, start+num)
-        LOG.debug("interval: %s desc: %s",
-                  min(start+num - cstart, FEED_INTERVAL), desc)
         ilist = zrange(feed, cstart,
                        cstart-1+min(start+num - cstart, FEED_INTERVAL))
 
@@ -77,9 +74,6 @@ def generate_plain_feed(feed, start, num, desc, value):
     cstart = start
 
     while cstart < (start+num):
-        LOG.debug("cstart: %s start+num: %s", cstart, start+num)
-        LOG.debug("interval: %s desc: %s",
-                  min(start+num - cstart, FEED_INTERVAL), desc)
         ilist = zrange(feed, cstart,
                        cstart-1+min(start+num - cstart, FEED_INTERVAL))
 
@@ -106,9 +100,6 @@ def generate_json_feed(feed, start, num, desc, value):
     firstelement = True
 
     while cstart < (start+num):
-        LOG.debug("cstart: %s start+num: %s", cstart, start+num)
-        LOG.debug("interval: %s desc: %s",
-                  min(start+num - cstart, FEED_INTERVAL), desc)
         ilist = zrange(feed, cstart,
                        cstart-1+min(start+num - cstart, FEED_INTERVAL))
 
@@ -165,9 +156,11 @@ _FEED_FORMATS = {
 }
 
 
-@app.route('/feeds/<feed>', methods=['GET'])
-@flask.ext.login.login_required
+@BLUEPRINT.route('/<feed>', methods=['GET'], feeds=True, read_write=False)
 def get_feed_content(feed):
+    if not current_user.check_feed(feed):
+        return 'Unauthorized', 401
+
     # check if feed exists
     status = MMMaster.status()
     tr = status.get('result', None)

@@ -15,8 +15,11 @@
 from __future__ import absolute_import
 
 import logging
+import shutil
+
 import gevent
 import gevent.queue
+import gevent.event
 
 import amqp
 import ujson
@@ -30,6 +33,7 @@ import copy
 import re
 
 from . import base
+from . import actorbase
 from . import table
 from . import ft_states
 from . import condition
@@ -42,7 +46,7 @@ LOG = logging.getLogger(__name__)
 _MAX_AGE_OUT = ((1 << 32)-1)*1000
 
 
-class SyslogMatcher(base.BaseFT):
+class SyslogMatcher(actorbase.ActorBaseFT):
     def __init__(self, name, chassis, config):
         self.amqp_glet = None
 
@@ -134,11 +138,11 @@ class SyslogMatcher(base.BaseFT):
                 self.table_indicators.delete(itype+indicator)
 
         if v is not None:
-            for i in self.table.query(index='syslog_original_indicator',
-                                      from_key=itype+indicator,
-                                      to_key=itype+indicator,
-                                      include_value=False):
-                self.emit_withdraw(i)
+            for i, v in self.table.query(index='syslog_original_indicator',
+                                         from_key=itype+indicator,
+                                         to_key=itype+indicator,
+                                         include_value=True):
+                self.emit_withdraw(i, value=v)
                 self.table.delete(i)
 
     def _handle_ip(self, ip, source=True, message=None):
@@ -356,11 +360,26 @@ class SyslogMatcher(base.BaseFT):
         if self.amqp_glet is None:
             return
 
+        self.table.close()
+        self.table_indicators.close()
+        self.table_ipv4.close()
+
+    @staticmethod
+    def gc(name, config=None):
+        actorbase.ActorBaseFT.gc(name, config=config)
+        shutil.rmtree(name, ignore_errors=True)
+        shutil.rmtree('{}_indicators'.format(name), ignore_errors=True)
+        shutil.rmtree('{}_ipv4'.format(name), ignore_errors=True)
+
 
 class SyslogMiner(base.BaseFT):
     def __init__(self, name, chassis, config):
         self.amqp_glet = None
         self.ageout_glet = None
+        self._actor_glet = None
+        self._actor_queue = gevent.queue.Queue(maxsize=128)
+        self._msg_queue = gevent.queue.Queue(maxsize=1)
+        self._do_process = gevent.event.Event()
 
         self.active_requests = []
         self.rebuild_flag = False
@@ -418,7 +437,9 @@ class SyslogMiner(base.BaseFT):
         self._initialize_table()
 
     def rebuild(self):
-        self.rebuild_flag = True
+        self._actor_queue.put(
+            (utc_millisec(), 'rebuild')
+        )
         self._initialize_table(truncate=(self.last_checkpoint is None))
 
     def reset(self):
@@ -498,36 +519,34 @@ class SyslogMiner(base.BaseFT):
 
     @base.BaseFT.state.setter
     def state(self, value):
-        LOG.debug("%s - acquiring state write lock", self.name)
         self.state_lock.lock()
         #  this is weird ! from stackoverflow 10810369
         super(SyslogMiner, self.__class__).state.fset(self, value)
         self.state_lock.unlock()
-        LOG.debug("%s - releasing state write lock", self.name)
 
-    def _age_out_run(self):
-        while True:
-            self.state_lock.rlock()
+    def _command_rebuild(self):
+        with self.state_lock:
             if self.state != ft_states.STARTED:
-                self.state_lock.runlock()
+                return
+
+            for i, v in self.table.query(include_value=True):
+                indicator, _ = i.split('\0', 1)
+                self.emit_update(indicator=indicator, value=v)
+
+    def _command_age_out(self):
+        with self.state_lock:
+            if self.state != ft_states.STARTED:
                 return
 
             try:
                 now = utc_millisec()
 
-                LOG.debug('now: %s', now)
-
                 for i, v in self.table.query(index='_age_out',
                                              to_key=now-1,
                                              include_value=True):
-                    LOG.debug('%s - %s %s aged out', self.name, i, v)
+                    indicator, _ = i.split('\0', 1)
 
-                    if v.get('_withdrawn', None) is not None:
-                        continue
-
-                    i, _ = i.split('\0', 1)
-
-                    self.emit_withdraw(indicator=i)
+                    self.emit_withdraw(indicator=indicator, value=v)
                     self.table.delete(i)
 
                     self.statistics['aged_out'] += 1
@@ -535,18 +554,10 @@ class SyslogMiner(base.BaseFT):
                 self.last_ageout_run = now
 
             except gevent.GreenletExit:
-                break
+                raise
 
             except:
                 LOG.exception('Exception in _age_out_loop')
-
-            finally:
-                self.state_lock.runlock()
-
-            try:
-                gevent.sleep(self.age_out['interval'])
-            except gevent.GreenletExit:
-                break
 
     def _calc_age_out(self, indicator, attributes):
         t = attributes.get('type', None)
@@ -563,13 +574,10 @@ class SyslogMiner(base.BaseFT):
         return b + sel['offset']
 
     def _apply_rule(self, f, message):
-        LOG.debug('%s - applying %s', self.name, f['name'])
-
         r = True
         for c in f['conditions']:
             r &= c.eval(message)
 
-        LOG.debug('%s - %s result: %s', self.name, f['name'], r)
         if not r:
             return
 
@@ -604,8 +612,6 @@ class SyslogMiner(base.BaseFT):
 
     @base._counting('syslog.processed')
     def _handle_syslog_message(self, message):
-        LOG.debug('%s - %s', self.name, message)
-
         devices_attribute = '%s_devices' % self.prefix
 
         now = utc_millisec()
@@ -639,8 +645,6 @@ class SyslogMiner(base.BaseFT):
                     self.table.put(ikey, cv)
                     self.emit_update(indicator, cv)
 
-                    LOG.debug('%s - added %s %s', self.name, indicator, cv)
-
                 else:
                     cv['last_seen'] = now
                     cv.update(value)
@@ -651,10 +655,64 @@ class SyslogMiner(base.BaseFT):
                     self.table.put(ikey, cv)
                     self.emit_update(indicator, cv)
 
+    def _actor_loop(self):
+        while True:
+            msg = None
+
+            try:
+                msg = self._actor_queue.get(block=False)
+            except gevent.queue.Empty:
+                msg = None
+
+            if msg is not None:
+                _, command = msg
+                if command == 'age_out':
+                    self._command_age_out()
+                elif command == 'rebuild':
+                    self._command_rebuild()
+                else:
+                    LOG.error('{} - unknown command {} - ignored'.format(
+                        self.name,
+                        command
+                    ))
+
+            msg = None
+            try:
+                while self._msg_queue.qsize() != 0:
+                    msg = self._msg_queue.get(block=False)
+
+                    try:
+                        self._handle_syslog_message(msg)
+                    except gevent.GreenletExit:
+                        raise
+                    except:
+                        LOG.exception('{} - exception handling message'.format(self.name))
+
+            except gevent.queue.Empty:
+                pass
+
+            self._do_process.wait()
+            self._do_process.clear()
+
+    def _age_out_loop(self):
+        while True:
+            self._actor_queue.put(
+                (utc_millisec(), 'age_out')
+            )
+            self._do_process.set()
+
+            try:
+                gevent.sleep(self.age_out['interval'])
+
+            except gevent.GreenletExit:
+                break
+
     def _amqp_callback(self, msg):
         try:
+            LOG.info(u'{}'.format(msg.body))
             message = ujson.loads(msg.body)
-            self._handle_syslog_message(message)
+            self._msg_queue.put(message)
+            self._do_process.set()
 
         except gevent.GreenletExit:
             raise
@@ -669,20 +727,10 @@ class SyslogMiner(base.BaseFT):
         while self.last_ageout_run is None:
             gevent.sleep(1)
 
-        self.state_lock.rlock()
-        if self.state != ft_states.STARTED:
-            self.state_lock.runlock()
-            return
-
-        try:
-            if self.rebuild_flag:
-                LOG.debug("rebuild flag set, resending current indicators")
-                # reinit flag is set, emit update for all the known indicators
-                for i, v in self.table.query(include_value=True):
-                    type_, i = i.split('\0', 1)
-                    self.emit_update(i, v)
-        finally:
-            self.state_lock.unlock()
+        with self.state_lock:
+            if self.state != ft_states.STARTED:
+                LOG.error('{} - wrong state in amqp_consumer'.format(self.name))
+                return
 
         while True:
             try:
@@ -735,7 +783,8 @@ class SyslogMiner(base.BaseFT):
             random.randint(0, 2),
             self._amqp_consumer
         )
-        self.ageout_glet = gevent.spawn(self._age_out_run)
+        self.ageout_glet = gevent.spawn(self._age_out_loop)
+        self._actor_glet = gevent.spawn(self._actor_loop)
 
     def stop(self):
         super(SyslogMiner, self).stop()
@@ -748,9 +797,31 @@ class SyslogMiner(base.BaseFT):
 
         self.amqp_glet.kill()
         self.ageout_glet.kill()
+        self._actor_glet.kill()
+
+        self.table.close()
 
         LOG.info("%s - # indicators: %d", self.name, self.table.num_indicators)
 
     def hup(self, source=None):
         LOG.info('%s - hup received, reload filters', self.name)
         self._load_side_config()
+
+    @staticmethod
+    def gc(name, config=None):
+        base.BaseFT.gc(name, config=config)
+
+        shutil.rmtree(name, ignore_errors=True)
+        side_config_path = None
+        if config is not None:
+            side_config_path = config.get('rules', None)
+        if side_config_path is None:
+            side_config_path = os.path.join(
+                os.environ['MM_CONFIG_DIR'],
+                '{}_rules.yml'.format(name)
+            )
+
+        try:
+            os.remove(side_config_path)
+        except:
+            pass

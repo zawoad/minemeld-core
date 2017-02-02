@@ -47,14 +47,17 @@ class MineMeldFTTableTests(unittest.TestCase):
     def test_truncate(self):
         table = minemeld.ft.table.Table(TABLENAME)
         table.put('key', {'a': 1})
+        table.close()
         table = None
 
         table = minemeld.ft.table.Table(TABLENAME)
         self.assertEqual(table.num_indicators, 1)
+        table.close()
         table = None
 
         table = minemeld.ft.table.Table(TABLENAME, truncate=True)
         self.assertEqual(table.num_indicators, 0)
+        table.close()
 
     def test_insert(self):
         table = minemeld.ft.table.Table(TABLENAME)
@@ -66,22 +69,81 @@ class MineMeldFTTableTests(unittest.TestCase):
             table.put(key, value)
 
         self.assertEqual(table.num_indicators, NUM_ELEMENTS)
+        table.close()
 
     def test_index_query(self):
         table = minemeld.ft.table.Table(TABLENAME)
         table.create_index('a')
 
-        for i in range(NUM_ELEMENTS):
-            value = {'a': random.randint(0, 500)}
+        num_below_500 = 0
+        for i in xrange(NUM_ELEMENTS):
+            value = {'a': random.randint(0, 1000)}
             key = 'i%d' % i
             table.put(key, value)
+            if value['a'] <= 500:
+                num_below_500 += 1
 
         j = 0
         for k, v in table.query('a', from_key=0, to_key=500,
                                 include_value=True):
             j += 1
 
-        self.assertEqual(j, NUM_ELEMENTS)
+        self.assertEqual(j, num_below_500)
+        table.close()
+
+    def test_index_query_2(self):
+        table = minemeld.ft.table.Table(TABLENAME)
+        table.create_index('a')
+
+        for i in xrange(NUM_ELEMENTS):
+            value = {'a': 1483184218151+random.randint(600, 1000)}
+            key = 'i%d' % i
+            table.put(key, value)
+
+        num_below_500 = 0
+        for i in xrange(NUM_ELEMENTS):
+            value = {'a': 1483184218151+random.randint(0, 1000)}
+            key = 'i%d' % i
+            table.put(key, value)
+            if value['a'] <= 1483184218151+500:
+                num_below_500 += 1
+
+        j = 0
+        for k, v in table.query('a', to_key=1483184218151+500,
+                                include_value=True):
+            j += 1
+
+        self.assertEqual(j, num_below_500)
+        table.close()
+
+    def test_index_query_3(self):
+        table = minemeld.ft.table.Table(TABLENAME)
+        table.create_index('a')
+
+        for i in xrange(NUM_ELEMENTS):
+            value = {'a': 1483184218151+random.randint(0, 500)}
+            key = 'i%d' % i
+            table.put(key, value)
+
+        for i in xrange(NUM_ELEMENTS):
+            key = 'i%d' % i
+            table.delete(key)
+
+        num_below_500 = 0
+        for i in xrange(NUM_ELEMENTS):
+            value = {'a': 1483184218151+random.randint(0, 1000)}
+            key = 'i%d' % i
+            table.put(key, value)
+            if value['a'] <= 1483184218151+500:
+                num_below_500 += 1
+
+        j = 0
+        for k, v in table.query('a', to_key=1483184218151+500,
+                                include_value=True):
+            j += 1
+
+        self.assertEqual(j, num_below_500)
+        table.close()
 
     def test_query(self):
         table = minemeld.ft.table.Table(TABLENAME)
@@ -97,6 +159,7 @@ class MineMeldFTTableTests(unittest.TestCase):
             j += 1
 
         self.assertEqual(j, NUM_ELEMENTS)
+        table.close()
 
     def test_exists(self):
         table = minemeld.ft.table.Table(TABLENAME)
@@ -113,6 +176,7 @@ class MineMeldFTTableTests(unittest.TestCase):
                 table.exists('i%d' % j),
                 msg="i%d does not exists" % j
             )
+        table.close()
 
     def test_not_exists(self):
         table = minemeld.ft.table.Table(TABLENAME)
@@ -126,6 +190,7 @@ class MineMeldFTTableTests(unittest.TestCase):
         for i in range(NUM_ELEMENTS):
             j = random.randint(NUM_ELEMENTS, 2*NUM_ELEMENTS)
             self.assertFalse(table.exists('i%d' % j))
+        table.close()
 
     def test_update(self):
         table = minemeld.ft.table.Table(TABLENAME)
@@ -143,6 +208,7 @@ class MineMeldFTTableTests(unittest.TestCase):
 
         self.assertEqual(rk, 'k2')
         self.assertEqual(ok, 1)
+        table.close()
 
     @attr('slow')
     def test_random(self):
@@ -202,6 +268,7 @@ class MineMeldFTTableTests(unittest.TestCase):
                 j = j+1
 
         # close table
+        table.close()
         table = None
 
         # reopen
@@ -218,6 +285,8 @@ class MineMeldFTTableTests(unittest.TestCase):
             de = flatdict[j]
             self.assertEqual(de[1]['a'], v['a'])
             j = j+1
+
+        table.close()
 
     @attr('slow')
     def test_write(self):

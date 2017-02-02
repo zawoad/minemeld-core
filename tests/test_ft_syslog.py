@@ -141,9 +141,9 @@ class MineMeldFTSyslogMatcherests(unittest.TestCase):
         a.connect(inputs, output)
         a.mgmtbus_initialize()
         a.start()
-        self.assertEqual(spawnl_mock.call_count, 1)
+        self.assertEqual(spawnl_mock.call_count, 2)
 
-        a.update('a', indicator='1.1.1.1-1.1.1.2', value={
+        a.filtered_update('a', indicator='1.1.1.1-1.1.1.2', value={
             'type': 'IPv4',
             'confidence': 100
         })
@@ -171,9 +171,6 @@ class MineMeldFTSyslogMatcherests(unittest.TestCase):
         )
 
         a.stop()
-        a.table.db.close()
-        a.table_ipv4.db.close()
-        a.table_indicators.db.close()
 
         a = None
         chassis = None
@@ -205,21 +202,25 @@ class MineMeldFTSyslogMatcherests(unittest.TestCase):
         a.mgmtbus_initialize()
         a.start()
 
-        a.update('a', indicator='1.1.1.1-1.1.1.2', value={
+        a.filtered_update('a', indicator='1.1.1.1-1.1.1.2', value={
             'type': 'IPv4',
             'confidence': 100
         })
         a._handle_ip('1.1.1.1')
 
         ochannel.publish.reset_mock()
-        a.withdraw('a', indicator='1.1.1.1-1.1.1.2')
+        a.filtered_withdraw('a', indicator='1.1.1.1-1.1.1.2')
         self.assertTrue(
             check_for_rpc(
                 ochannel.publish.call_args_list,
                 [
                     {
                         'method': 'withdraw',
-                        'indicator': '1.1.1.1'
+                        'indicator': '1.1.1.1',
+                        'value': {
+                            'type': 'IPv4',
+                            'confidence': 100
+                        }
                     }
                 ],
                 all_here=True
@@ -227,9 +228,6 @@ class MineMeldFTSyslogMatcherests(unittest.TestCase):
         )
 
         a.stop()
-        a.table.db.close()
-        a.table_ipv4.db.close()
-        a.table_indicators.db.close()
 
         a = None
         chassis = None
@@ -261,11 +259,11 @@ class MineMeldFTSyslogMatcherests(unittest.TestCase):
         a.mgmtbus_initialize()
         a.start()
 
-        a.update('a', indicator='1.1.1.1-1.1.1.2', value={
+        a.filtered_update('a', indicator='1.1.1.1-1.1.1.2', value={
             'type': 'IPv4',
             'confidence': 100
         })
-        a.update('a', indicator='1.1.1.4-1.1.1.5', value={
+        a.filtered_update('a', indicator='1.1.1.4-1.1.1.5', value={
             'type': 'IPv4',
             'confidence': 100
         })
@@ -273,9 +271,6 @@ class MineMeldFTSyslogMatcherests(unittest.TestCase):
         self.assertEqual(ochannel.publish.call_count, 0)
 
         a.stop()
-        a.table.db.close()
-        a.table_ipv4.db.close()
-        a.table_indicators.db.close()
 
         a = None
         chassis = None
@@ -306,9 +301,9 @@ class MineMeldFTSyslogMatcherests(unittest.TestCase):
         a.connect(inputs, output)
         a.mgmtbus_initialize()
         a.start()
-        self.assertEqual(spawnl_mock.call_count, 1)
+        self.assertEqual(spawnl_mock.call_count, 2)
 
-        a.update('a', indicator='www.example.com', value={
+        a.filtered_update('a', indicator='www.example.com', value={
             'type': 'domain',
             'confidence': 100
         })
@@ -336,9 +331,6 @@ class MineMeldFTSyslogMatcherests(unittest.TestCase):
         )
 
         a.stop()
-        a.table.db.close()
-        a.table_ipv4.db.close()
-        a.table_indicators.db.close()
 
         a = None
         chassis = None
@@ -370,14 +362,14 @@ class MineMeldFTSyslogMatcherests(unittest.TestCase):
         a.mgmtbus_initialize()
         a.start()
 
-        a.update('a', indicator='www.example.com', value={
+        a.filtered_update('a', indicator='www.example.com', value={
             'type': 'domain',
             'confidence': 100
         })
         a._handle_url('www.example.com/cgi/addressbook.php')
 
         ochannel.publish.reset_mock()
-        a.withdraw('a', indicator='www.example.com')
+        a.filtered_withdraw('a', indicator='www.example.com')
         self.assertEqual(a.table_indicators.num_indicators, 0)
         self.assertTrue(
             check_for_rpc(
@@ -385,7 +377,11 @@ class MineMeldFTSyslogMatcherests(unittest.TestCase):
                 [
                     {
                         'method': 'withdraw',
-                        'indicator': 'www.example.com'
+                        'indicator': 'www.example.com',
+                        'value': {
+                            'type': 'domain',
+                            'confidence': 100
+                        }
                     }
                 ],
                 all_here=True
@@ -393,9 +389,6 @@ class MineMeldFTSyslogMatcherests(unittest.TestCase):
         )
 
         a.stop()
-        a.table.db.close()
-        a.table_ipv4.db.close()
-        a.table_indicators.db.close()
 
         a = None
         chassis = None
@@ -432,7 +425,7 @@ class MineMeldFTSyslogMatcherests(unittest.TestCase):
         a.mgmtbus_initialize()
         a.start()
 
-        a.update('a', indicator='www.example.com', value={
+        a.filtered_update('a', indicator='www.example.com', value={
             'type': 'domain',
             'confidence': 100
         })
@@ -447,9 +440,6 @@ class MineMeldFTSyslogMatcherests(unittest.TestCase):
         self.assertEqual(mock_socket.sendall.call_count, 1)
 
         a.stop()
-        a.table.db.close()
-        a.table_ipv4.db.close()
-        a.table_indicators.db.close()
 
         a = None
         chassis = None
@@ -486,7 +476,7 @@ class MineMeldFTSyslogMatcherests(unittest.TestCase):
         a.mgmtbus_initialize()
         a.start()
 
-        a.update('a', indicator='1.1.1.0-1.1.1.20', value={
+        a.filtered_update('a', indicator='1.1.1.0-1.1.1.20', value={
             'type': 'IPv4',
             'confidence': 100
         })
@@ -498,9 +488,6 @@ class MineMeldFTSyslogMatcherests(unittest.TestCase):
         self.assertEqual(mock_socket.sendall.call_count, 1)
 
         a.stop()
-        a.table.db.close()
-        a.table_ipv4.db.close()
-        a.table_indicators.db.close()
 
         a = None
         chassis = None
@@ -537,7 +524,7 @@ class MineMeldFTSyslogMatcherests(unittest.TestCase):
         a.mgmtbus_initialize()
         a.start()
 
-        a.update('a', indicator='1.1.1.0-1.1.1.20', value={
+        a.filtered_update('a', indicator='1.1.1.0-1.1.1.20', value={
             'type': 'IPv4',
             'confidence': 100
         })
@@ -558,9 +545,6 @@ class MineMeldFTSyslogMatcherests(unittest.TestCase):
         )
 
         a.stop()
-        a.table.db.close()
-        a.table_ipv4.db.close()
-        a.table_indicators.db.close()
 
         a = None
         chassis = None

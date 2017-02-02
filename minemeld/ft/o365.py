@@ -26,7 +26,10 @@ LOG = logging.getLogger(__name__)
 
 O365_URL = \
     'https://support.content.office.net/en-us/static/O365IPAddresses.xml'
-BASE_XPATH = "/products/product[@name='%s']"
+XPATH_FUNS_NS = 'http://minemeld.panw.io/o365functions'
+XPATH_FUNS_PREFIX = 'o365f'
+XPATH_PRODUCTS = "/products/product/@name"
+BASE_XPATH = "/products/product[" + XPATH_FUNS_PREFIX + ":lower-case(@name)='%s']"
 
 
 def _build_IPv4(source, address):
@@ -59,9 +62,18 @@ def _build_URL(source, url):
     return item
 
 
+def _xpath_lower_case(context, a):
+    return [e.lower() for e in a]
+
+
 class O365XML(basepoller.BasePollerFT):
     def configure(self):
         super(O365XML, self).configure()
+
+        # register lower-case
+        ns = lxml.etree.FunctionNamespace(XPATH_FUNS_NS)
+        ns['lower-case'] = _xpath_lower_case
+        self.prefixmap = {XPATH_FUNS_PREFIX: XPATH_FUNS_NS}
 
         self.polling_timeout = self.config.get('polling_timeout', 20)
         self.verify_cert = self.config.get('verify_cert', True)
@@ -79,7 +91,7 @@ class O365XML(basepoller.BasePollerFT):
 
         return r.prepare()
 
-    def _build_iterator(self, now):
+    def _o365_iterator(self, now):
         _iterators = []
 
         _session = requests.Session()
@@ -110,30 +122,56 @@ class O365XML(basepoller.BasePollerFT):
             raise
 
         rtree = lxml.etree.parse(r.raw)
-        for p in self.products:
-            xpath = BASE_XPATH % p
+
+        products = self.products
+        if len(products) == 0:
+            products = self._extract_products(rtree)
+
+        for p in products:
+            xpath = BASE_XPATH % p.lower()
             pIPv4s = rtree.xpath(
-                xpath + "/addresslist[@type='IPv4']/address"
+                xpath + "/addresslist[@type='IPv4']/address",
+                namespaces=self.prefixmap
             )
             _iterators.append(itertools.imap(
-                functools.partial(_build_IPv4, 'office365.%s' % p),
+                functools.partial(_build_IPv4, 'office365.%s' % p.lower()),
                 pIPv4s
             ))
 
             pIPv6s = rtree.xpath(
-                xpath + "/addresslist[@type='IPv6']/address"
+                xpath + "/addresslist[@type='IPv6']/address",
+                namespaces=self.prefixmap
             )
             _iterators.append(itertools.imap(
-                functools.partial(_build_IPv6, 'office365.%s' % p),
+                functools.partial(_build_IPv6, 'office365.%s' % p.lower()),
                 pIPv6s
             ))
 
             pURLs = rtree.xpath(
-                xpath + "/addresslist[@type='URL']/address"
+                xpath + "/addresslist[@type='URL']/address",
+                namespaces=self.prefixmap
             )
             _iterators.append(itertools.imap(
-                functools.partial(_build_URL, 'office365.%s' % p),
+                functools.partial(_build_URL, 'office365.%s' % p.lower()),
                 pURLs
             ))
 
         return itertools.chain(*_iterators)
+
+    def _build_iterator(self, now):
+        oiterator = self._o365_iterator(now)
+
+        idict = {}
+        for i in oiterator:
+            indicator = i['indicator']
+            cvalue = idict.get(indicator, None)
+            if cvalue is not None:
+                i['sources'] = list(set(i['sources']) | set(cvalue['sources']))
+            idict[indicator] = i
+
+        return itertools.imap(lambda i: i[1], idict.iteritems())
+
+    def _extract_products(self, rtree):
+        products = rtree.xpath(XPATH_PRODUCTS)
+        LOG.info('%s - found products: %r', self.name, products)
+        return products

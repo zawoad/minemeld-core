@@ -6,6 +6,7 @@ import time
 import sys
 import argparse
 import shutil
+import json
 import xmlrpclib
 import supervisor.xmlrpc
 
@@ -20,6 +21,18 @@ def _parse_args():
         '--dry-run',
         action='store_true',
         help='Dry run'
+    )
+    parser.add_argument(
+        '--all',
+        action='store_true',
+        help='Delete all traces'
+    )
+    parser.add_argument(
+        'config',
+        action='store',
+        metavar='CONFIG',
+        nargs='?',
+        help='path of the config file or of the config directory'
     )
     return parser.parse_args()
 
@@ -90,6 +103,10 @@ def start_minemeld_traced(supervisor_url):
 
 
 def main():
+    trace_directory = '/opt/minemeld/local/trace'
+    supervisor_url = 'unix:///var/run/minemeld/minemeld.sock'
+    num_days = 30
+
     logging.basicConfig(
         level=logging.DEBUG,
         format='%(asctime)s %(levelname)s: %(message)s'
@@ -97,15 +114,30 @@ def main():
 
     args = _parse_args()
 
+    if args.config is not None:
+        try:
+            with open(args.config, 'r') as f:
+                config = json.load(f)
+
+        except (IOError, ValueError) as e:
+            LOG.critical(
+                'Error loading config file %s: %s' % (args.config, str(e))
+            )
+            sys.exit(1)
+
+        trace_directory = config.get('trace_directory', trace_directory)
+        supervisor_url = config.get('supervisor_url', supervisor_url)
+        num_days = config.get('num_days', num_days)
+
     trace_directory = os.environ.get(
         'MINEMELD_TRACE_DIRECTORY',
-        '/opt/minemeld/local/trace'
+        trace_directory
     )
     if not os.path.isdir(trace_directory):
         LOG.critical("%s is not a directory", trace_directory)
         sys.exit(1)
 
-    num_days = int(os.environ.get('MINEMELD_TRACE_NUM_DAYS', 30))
+    num_days = int(os.environ.get('MINEMELD_TRACE_NUM_DAYS', num_days))
     if num_days < 1:
         LOG.critical(
             'MINEMELD_TRACE_NUM_DAYS should be greater than 1: %d',
@@ -115,7 +147,7 @@ def main():
 
     supervisor_url = os.environ.get(
         'SUPERVISOR_URL',
-        'unix:///opt/minemeld/local/supervisor/run/minemeld.sock'
+        supervisor_url
     )
 
     LOG.info(
@@ -137,7 +169,7 @@ def main():
             LOG.debug("Invalid table name: %s", t)
             continue
 
-        if d < oldest:
+        if d < oldest or args.all:
             LOG.info('Marking table %s for removal', t)
             tobe_removed.append(t)
 

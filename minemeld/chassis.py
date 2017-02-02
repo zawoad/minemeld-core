@@ -19,6 +19,7 @@ A chassis instance contains a list of nodes and a fabric.
 Nodes communicate using the fabric.
 """
 
+import os
 import logging
 
 import gevent
@@ -44,8 +45,10 @@ class Chassis(object):
         mgmtbusconfig (dict): config dictionary for mgmt bus
     """
     def __init__(self, fabricclass, fabricconfig, mgmtbusconfig):
+        self.chassis_id = os.getpid()
+
         self.fts = {}
-        self.poweroff = None
+        self.poweroff = gevent.event.AsyncResult()
 
         self.fabric_class = fabricclass
         self.fabric_config = fabricconfig
@@ -61,6 +64,7 @@ class Chassis(object):
             mgmtbusconfig['transport']['config']
         )
         self.mgmtbus.add_failure_listener(self.mgmtbus_failed)
+        self.mgmtbus.request_chassis_rpc_channel(self)
 
         self.log_channel_queue = gevent.queue.Queue(maxsize=128)
         self.log_channel = self.mgmtbus.request_log_channel()
@@ -106,6 +110,13 @@ class Chassis(object):
 
         # XXX should be moved to constructor
         self.mgmtbus.start()
+        self.fabric.start()
+
+        self.mgmtbus.send_master_rpc(
+            'chassis_ready',
+            params={'chassis_id': self.chassis_id},
+            timeout=10
+        )
 
     def request_mgmtbus_channel(self, ft):
         self.mgmtbus.request_channel(ft)
@@ -136,7 +147,7 @@ class Chassis(object):
                     params=params
                 )
 
-            except Exception as e:
+            except Exception:
                 LOG.exception('Error sending log')
 
     def log(self, timestamp, nodename, log_type, value):
@@ -156,7 +167,7 @@ class Chassis(object):
                     params=params
                 )
 
-            except Exception as e:
+            except Exception:
                 LOG.exception('Error publishing status')
 
     def publish_status(self, timestamp, nodename, status):
@@ -172,6 +183,11 @@ class Chassis(object):
     def mgmtbus_failed(self):
         LOG.critical('chassis - mgmtbus failed')
         self.stop()
+
+    def mgmtbus_start(self):
+        LOG.info('chassis - start received from mgmtbus')
+        self.start()
+        return 'ok'
 
     def fts_init(self):
         for ft in self.fts.values():
@@ -191,8 +207,11 @@ class Chassis(object):
         if self.fabric is None:
             return
 
-        for _, ft in self.fts.iteritems():
-            ft.stop()
+        for ftname, ft in self.fts.iteritems():
+            try:
+                ft.stop()
+            except:
+                LOG.exception('Error stopping {}'.format(ftname))
 
         LOG.info('Stopping fabric')
         self.fabric.stop()
@@ -209,13 +228,8 @@ class Chassis(object):
         self.log_glet = gevent.spawn(self._log_actor)
         self.status_glet = gevent.spawn(self._status_actor)
 
-        if self.fabric is None:
-            return
-
-        self.fabric.start()
-
         for ftname, ft in self.fts.iteritems():
             LOG.debug("starting %s", ftname)
             ft.start()
 
-        self.poweroff = gevent.event.AsyncResult()
+        self.fabric.start_dispatching()

@@ -12,26 +12,29 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-import logging
 import datetime
 
 import pytz
+import lz4
 
 import libtaxii
 import libtaxii.constants
+import stix.core
 
-from flask import request
-from flask import Response
-from flask import stream_with_context
+from flask import request, Response, stream_with_context
+from flask.ext.login import current_user
 
-import flask.ext.login
-
-from . import app
-from . import SR
+from .redisclient import SR
 from .taxiiutils import taxii_check, get_taxii_feeds
+from .aaa import MMBlueprint
+from .logger import LOG
 from minemeld.ft.utils import dt_to_millisec
 
-LOG = logging.getLogger(__name__)
+
+__all__ = ['BLUEPRINT']
+
+
+BLUEPRINT = MMBlueprint('taxiipoll', __name__, url_prefix='')
 
 
 _TAXII_POLL_RESPONSE_HEADER = """
@@ -71,6 +74,18 @@ def _indicators_feed(feed, excbegtime, incendtime):
 
         for i in indicators:
             value = SR.hget(feed + '.value', i)
+
+            if value.startswith('lz4'):
+                try:
+                    value = lz4.decompress(value[3:])
+                    value = stix.core.STIXPackage.from_json(value)
+                    value = value.to_xml(
+                        ns_dict={'https://go.paloaltonetworks.com/minemeld': 'minemeld'}
+                    )
+
+                except ValueError:
+                    continue
+
             yield value
 
         if len(indicators) < 100:
@@ -126,8 +141,7 @@ def data_feed_11(rmsgid, cname, excbegtime, incendtime):
     )
 
 
-@app.route('/taxii-poll-service', methods=['POST'])
-@flask.ext.login.login_required
+@BLUEPRINT.route('/taxii-poll-service', methods=['POST'], feeds=True, read_write=False)
 @taxii_check
 def taxii_poll_service():
     taxiict = request.headers['X-TAXII-Content-Type']
@@ -139,6 +153,9 @@ def taxii_poll_service():
         cname = tm.collection_name
         excbegtime = tm.exclusive_begin_timestamp_label
         incendtime = tm.inclusive_end_timestamp_label
+
+        if not current_user.check_feed(cname):
+            return 'Unauthorized', 401
 
         return data_feed_11(tm.message_id, cname, excbegtime, incendtime)
 

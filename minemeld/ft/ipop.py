@@ -15,8 +15,10 @@
 import logging
 import netaddr
 import uuid
+import shutil
 
 from . import base
+from . import actorbase
 from . import table
 from . import st
 from .utils import utc_millisec
@@ -51,7 +53,7 @@ class MWUpdate(object):
             self.end == other.end
 
 
-class AggregateIPv4FT(base.BaseFT):
+class AggregateIPv4FT(actorbase.ActorBaseFT):
     def __init__(self, name, chassis, config):
         self.active_requests = []
 
@@ -83,17 +85,20 @@ class AggregateIPv4FT(base.BaseFT):
     def _indicator_key(self, indicator, source):
         return indicator+'\x00'+source
 
-    def _calc_indicator_value(self, uuids):
+    def _calc_indicator_value(self, uuids, additional_uuid=None, additional_value=None):
         mv = {'sources': []}
         for uuid_ in uuids:
-            # uuid_ = str(uuid.UUID(bytes=uuid_))
-            k, v = next(
-                self.table.query('_id', from_key=uuid_, to_key=uuid_,
-                                 include_value=True),
-                (None, None)
-            )
-            if k is None:
-                LOG.error("Unable to find key associated with uuid: %s", uuid_)
+            if uuid_ == additional_uuid:
+                v = additional_value
+            else:
+                # uuid_ = str(uuid.UUID(bytes=uuid_))
+                k, v = next(
+                    self.table.query('_id', from_key=uuid_, to_key=uuid_,
+                                     include_value=True),
+                    (None, None)
+                )
+                if k is None:
+                    LOG.error("Unable to find key associated with uuid: %s", uuid_)
 
             for vk in v:
                 if vk in mv and vk in RESERVED_ATTRIBUTES:
@@ -251,8 +256,7 @@ class AggregateIPv4FT(base.BaseFT):
     def filtered_update(self, source=None, indicator=None, value=None):
         vtype = value.get('type', None)
         if vtype != 'IPv4':
-            LOG.debug('%s - update received from %s with type != IPv4 (%s)',
-                      self.name, source, vtype)
+            self.statistics['update.ignored'] += 1
             return
 
         v, newindicator = self._add_indicator(source, indicator, value)
@@ -311,11 +315,18 @@ class AggregateIPv4FT(base.BaseFT):
                     )
 
         for u in removed:
-            self.emit_withdraw(u.indicator())
+            self.emit_withdraw(
+                u.indicator(),
+                value=self._calc_indicator_value(u.uuids)
+            )
 
     @base._counting('withdraw.processed')
     def filtered_withdraw(self, source=None, indicator=None, value=None):
         LOG.debug("%s - withdraw from %s - %s", self.name, source, indicator)
+
+        if value is not None and value.get('type', None) != 'IPv4':
+            self.statistics['withdraw.ignored'] += 1
+            return
 
         ik = self._indicator_key(indicator, source)
 
@@ -370,7 +381,14 @@ class AggregateIPv4FT(base.BaseFT):
                     )
 
         for u in removed:
-            self.emit_withdraw(u.indicator())
+            self.emit_withdraw(
+                u.indicator(),
+                value=self._calc_indicator_value(
+                    u.uuids,
+                    additional_uuid=v['_id'],
+                    additional_value=v
+                )
+            )
 
     def _send_indicators(self, source=None, from_key=None, to_key=None):
         if from_key is None:
@@ -430,4 +448,13 @@ class AggregateIPv4FT(base.BaseFT):
             g.kill()
         self.active_requests = []
 
+        self.table.close()
+
         LOG.info("%s - # indicators: %d", self.name, self.table.num_indicators)
+
+    @staticmethod
+    def gc(name, config=None):
+        actorbase.ActorBaseFT.gc(name, config=config)
+
+        shutil.rmtree(name, ignore_errors=True)
+        shutil.rmtree('{}_st'.format(name), ignore_errors=True)

@@ -13,8 +13,10 @@
 #  limitations under the License.
 
 import logging
+import shutil
 
 from . import base
+from . import actorbase
 from . import table
 from .utils import utc_millisec
 from .utils import RESERVED_ATTRIBUTES
@@ -22,7 +24,7 @@ from .utils import RESERVED_ATTRIBUTES
 LOG = logging.getLogger(__name__)
 
 
-class AggregateFT(base.BaseFT):
+class AggregateFT(actorbase.ActorBaseFT):
     _ftclass = 'AggregateFT'
 
     def __init__(self, name, chassis, config):
@@ -133,6 +135,15 @@ class AggregateFT(base.BaseFT):
 
     @base._counting('withdraw.processed')
     def filtered_withdraw(self, source=None, indicator=None, value=None):
+        ikey = self._indicator_key(indicator, source)
+
+        cvalue = self.table.get(ikey)
+        e = (cvalue is not None)
+        if value is not None and cvalue is not None:
+            if value.get('type', None) != cvalue.get('type', None):
+                self.statistics['withdraw.ignored'] += 1
+                return
+
         ebl = 0
         ewl = 0
         for i in self.inputs:
@@ -142,8 +153,7 @@ class AggregateFT(base.BaseFT):
             else:
                 ebl += v
 
-        e = self.table.exists(self._indicator_key(indicator, source))
-        self.table.delete(self._indicator_key(indicator, source))
+        self.table.delete(ikey)
 
         if self._is_whitelist(source):
             # withdraw from whitelist
@@ -161,7 +171,7 @@ class AggregateFT(base.BaseFT):
                 if ebl > 1:
                     self._emit_update_indicator(indicator)
                 else:
-                    self.emit_withdraw(indicator)
+                    self.emit_withdraw(indicator, value=cvalue)
 
     def get(self, source=None, indicator=None):
         mv = {}
@@ -223,4 +233,11 @@ class AggregateFT(base.BaseFT):
             g.kill()
         self.active_requests = []
 
+        self.table.close()
+
         LOG.info("%s - # indicators: %d", self.name, self.table.num_indicators)
+
+    @staticmethod
+    def gc(name, config=None):
+        actorbase.ActorBaseFT.gc(name, config=config)
+        shutil.rmtree(name, ignore_errors=True)

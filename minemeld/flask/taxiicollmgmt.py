@@ -12,7 +12,6 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-import logging
 import re
 
 import libtaxii
@@ -20,22 +19,33 @@ import libtaxii.messages_11
 import libtaxii.constants
 
 from flask import request
+from flask.ext.login import current_user
 
-import flask.ext.login
-
-from . import app
 from . import config
 from .taxiiutils import taxii_check, taxii_make_response, get_taxii_feeds
+from .aaa import MMBlueprint
+from .logger import LOG
 
-LOG = logging.getLogger(__name__)
+
+__all__ = ['BLUEPRINT']
+
 
 HOST_RE = re.compile('^[a-zA-Z\d-]{1,63}(?:\.[a-zA-Z\d-]{1,63})*(?::[0-9]{1,5})*$')
 
+BLUEPRINT = MMBlueprint('taxiicollmgmt', __name__, url_prefix='')
 
-@app.route('/taxii-collection-management-service', methods=['POST'])
-@flask.ext.login.login_required
+
+@BLUEPRINT.route('/taxii-collection-management-service', methods=['POST'], feeds=True, read_write=False)
 @taxii_check
 def taxii_collection_mgmt_service():
+    taxii_feeds = get_taxii_feeds()
+    authorized_feeds = filter(
+        current_user.check_feed,
+        taxii_feeds
+    )
+    if len(authorized_feeds) == 0:
+        return 'Unauthorized', 401
+
     server_host = config.get('TAXII_HOST', None)
     if server_host is None:
         server_host = request.headers.get('Host', None)
@@ -55,8 +65,7 @@ def taxii_collection_mgmt_service():
         tm.message_id
     )
 
-    taxii_feeds = get_taxii_feeds()
-    for feed in taxii_feeds:
+    for feed in authorized_feeds:
         cii = libtaxii.messages_11.CollectionInformation(
             feed,
             '{} Data Feed'.format(feed),

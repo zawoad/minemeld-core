@@ -1,4 +1,4 @@
-#  Copyright 2015 Palo Alto Networks, Inc
+#  Copyright 2015-2017 Palo Alto Networks, Inc
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -12,23 +12,27 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-import logging
+import os
+import time
+from signal import SIGHUP
 
 import psutil
-import time
 import gevent
 import xmlrpclib
 import supervisor.xmlrpc
 
 from flask import jsonify
 
-import flask.ext.login
-
-from . import app
 from . import config
-from . import MMSupervisor
+from .supervisorclient import MMSupervisor
+from .aaa import MMBlueprint
+from .logger import LOG
 
-LOG = logging.getLogger(__name__)
+
+__all__ = ['BLUEPRINT']
+
+
+BLUEPRINT = MMBlueprint('supervisor', __name__, url_prefix='')
 
 
 def _restart_engine():
@@ -45,21 +49,25 @@ def _restart_engine():
         )
     )
 
-    result = sserver.supervisor.stopProcess('minemeld-engine', False)
-    if not result:
-        LOG.error('Stop minemeld-engine returned False')
-        return
+    try:
+        result = sserver.supervisor.stopProcess('minemeld-engine', False)
+        if not result:
+            LOG.error('Stop minemeld-engine returned False')
+            return
+
+    except xmlrpclib.Fault as e:
+        LOG.error('Error stopping minemeld-engine: {!r}'.format(e))
+
     LOG.info('Stopped minemeld-engine for API request')
 
     now = time.time()
     info = None
-    while (time.time()-now) < 60*15*1000:
+    while (time.time()-now) < 60*10*1000:
         info = sserver.supervisor.getProcessInfo('minemeld-engine')
-        if info['statename'] == 'STOPPED':
+        if info['statename'] in ('FATAL', 'STOPPED', 'UNKNOWN', 'EXITED'):
             break
         gevent.sleep(5)
-
-    if info is not None and info['statename'] != 'STOPPED':
+    else:
         LOG.error('Timeout during minemeld-engine restart')
         return
 
@@ -67,8 +75,7 @@ def _restart_engine():
     LOG.info('Started minemeld-engine')
 
 
-@app.route('/supervisor', methods=['GET'])
-@flask.ext.login.login_required
+@BLUEPRINT.route('/supervisor', methods=['GET'], read_write=False)
 def service_status():
     try:
         supervisorstate = MMSupervisor.supervisor.getState()
@@ -82,7 +89,8 @@ def service_status():
     for p in pinfo:
         process = {
             'statename': p['statename'],
-            'start': p['start']
+            'start': p['start'],
+            'children': None
         }
 
         try:
@@ -91,39 +99,45 @@ def service_status():
 
         except:
             LOG.exception("Error retrieving childen of %d" % p['pid'])
-            pass
 
         supervisorstate['processes'][p['name']] = process
 
     return jsonify(result=supervisorstate)
 
 
-@app.route('/supervisor/minemeld-engine/start', methods=['GET'])
-@flask.ext.login.login_required
+@BLUEPRINT.route('/supervisor/minemeld-engine/start', methods=['GET'], read_write=True)
 def start_minemeld_engine():
     result = MMSupervisor.supervisor.startProcess('minemeld-engine', False)
 
     return jsonify(result=result)
 
 
-@app.route('/supervisor/minemeld-engine/stop', methods=['GET'])
-@flask.ext.login.login_required
+@BLUEPRINT.route('/supervisor/minemeld-engine/stop', methods=['GET'], read_write=True)
 def stop_minemeld_engine():
     result = MMSupervisor.supervisor.stopProcess('minemeld-engine', False)
 
     return jsonify(result=result)
 
 
-@app.route('/supervisor/minemeld-engine/restart', methods=['GET'])
-@flask.ext.login.login_required
+@BLUEPRINT.route('/supervisor/minemeld-engine/restart', methods=['GET'], read_write=True)
 def restart_minemeld_engine():
     info = MMSupervisor.supervisor.getProcessInfo('minemeld-engine')
-    if info['statename'] != 'RUNNING':
+    if info['statename'] == 'STARTING' or info['statename'] == 'STOPPING':
         return jsonify(error={
             'message': ('minemeld-engine not in RUNNING state: %s' %
                         info['statename'])
         }), 400
 
     gevent.spawn(_restart_engine)
+
+    return jsonify(result='OK')
+
+
+@BLUEPRINT.route('/supervisor/minemeld-web/hup', methods=['GET'], read_write=True)
+def hup_minemeld_web():
+    info = MMSupervisor.supervisor.getProcessInfo('minemeld-web')
+
+    apipid = info['pid']
+    os.kill(apipid, SIGHUP)
 
     return jsonify(result='OK')

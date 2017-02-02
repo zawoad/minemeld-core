@@ -20,6 +20,8 @@ import urlparse
 import datetime
 import pytz
 import os.path
+import lz4
+
 import lxml.etree
 import yaml
 import uuid
@@ -27,6 +29,7 @@ import redis
 import gevent
 import gevent.event
 import netaddr
+import werkzeug.urls
 
 import libtaxii
 import libtaxii.clients
@@ -40,9 +43,11 @@ import cybox.core
 import cybox.objects.address_object
 import cybox.objects.domain_name_object
 import cybox.objects.uri_object
+import cybox.objects.file_object
 
 from . import basepoller
 from . import base
+from . import actorbase
 from .utils import dt_to_millisec, interval_in_sec, utc_millisec
 
 LOG = logging.getLogger(__name__)
@@ -68,6 +73,7 @@ class TaxiiClient(basepoller.BasePollerFT):
             )
             self.initial_interval = 86400
 
+        self.ip_version_auto_detect = self.config.get('ip_version_auto_detect', True)
         self.discovery_service = self.config.get('discovery_service', None)
         self.username = self.config.get('username', None)
         self.password = self.config.get('password', None)
@@ -471,11 +477,6 @@ class TaxiiClient(basepoller.BasePollerFT):
                     return None
 
         elif ot == 'AddressObjectType':
-            addrcat = op.get('category', None)
-            result['type'] = 'IPv4'
-            if addrcat == 'ipv6-addr':
-                result['type'] = 'IPv6'
-
             source = op.get('is_source', None)
             if source is True:
                 result['direction'] = 'inbound'
@@ -491,6 +492,32 @@ class TaxiiClient(basepoller.BasePollerFT):
                 if ov is None:
                     LOG.error('%s - no value in observable value', self.name)
                     return None
+
+            # set the IP Address type
+            if not self.ip_version_auto_detect:
+                addrcat = op.get('category', None)
+                if addrcat == 'ipv6-addr':
+                    result['type'] = 'IPv6'
+                elif addrcat == 'ipv4-addr':
+                    result['type'] = 'IPv4'
+            else:
+                # some feeds do not set the IP Address type and it
+                # defaults to ipv4-addr even if the IP is IPv6
+                # this is to auto detect the type
+                if type(ov) == list:
+                    address = ov[0]
+                else:
+                    address = ov
+
+                parsed = netaddr.IPNetwork(address)
+                if parsed.version == 4:
+                    result['type'] = 'IPv4'
+                elif parsed.version == 6:
+                    result['type'] = 'IPv6'
+
+            if 'type' not in result:
+                LOG.error('%s - no IP category and unknown version')
+                return None
 
         elif ot == 'URIObjectType':
             result['type'] = 'URL'
@@ -634,6 +661,24 @@ class TaxiiClient(basepoller.BasePollerFT):
         self._load_side_config()
         super(TaxiiClient, self).hup(source)
 
+    @staticmethod
+    def gc(name, config=None):
+        basepoller.BasePollerFT.gc(name, config=config)
+
+        side_config_path = None
+        if config is not None:
+            side_config_path = config.get('side_config', None)
+        if side_config_path is None:
+            side_config_path = os.path.join(
+                os.environ['MM_CONFIG_DIR'],
+                '{}_side_config.yml'.format(name)
+            )
+
+        try:
+            os.remove(side_config_path)
+        except:
+            pass
+
 
 def _stix_ip_observable(namespace, indicator, value):
     category = cybox.objects.address_object.Address.CAT_IPV4
@@ -715,6 +760,24 @@ def _stix_url_observable(namespace, indicator, value):
     return [o]
 
 
+def _stix_hash_observable(namespace, indicator, value):
+    id_ = '{}:observable-{}'.format(
+        namespace,
+        uuid.uuid4()
+    )
+
+    uo = cybox.objects.file_object.File()
+    uo.add_hash(indicator)
+
+    o = cybox.core.Observable(
+        title='{}: {}'.format(value['type'], indicator),
+        id_=id_,
+        item=uo
+    )
+
+    return [o]
+
+
 _TYPE_MAPPING = {
     'IPv4': {
         'indicator_type': stix.common.vocabs.IndicatorType.TERM_IP_WATCHLIST,
@@ -731,11 +794,23 @@ _TYPE_MAPPING = {
     'domain': {
         'indicator_type': stix.common.vocabs.IndicatorType.TERM_URL_WATCHLIST,
         'mapper': _stix_domain_observable
+    },
+    'sha256': {
+        'indicator_type': stix.common.vocabs.IndicatorType.TERM_FILE_HASH_WATCHLIST,
+        'mapper': _stix_hash_observable
+    },
+    'sha1': {
+        'indicator_type': stix.common.vocabs.IndicatorType.TERM_FILE_HASH_WATCHLIST,
+        'mapper': _stix_hash_observable
+    },
+    'md5': {
+        'indicator_type': stix.common.vocabs.IndicatorType.TERM_FILE_HASH_WATCHLIST,
+        'mapper': _stix_hash_observable
     }
 }
 
 
-class DataFeed(base.BaseFT):
+class DataFeed(actorbase.ActorBaseFT):
     def __init__(self, name, chassis, config):
         self.redis_skey = name
         self.redis_skey_value = name+'.value'
@@ -766,6 +841,8 @@ class DataFeed(base.BaseFT):
             LOG.info('%s - age out interval too small, forced to 60 seconds')
             self.age_out_interval = 60
 
+        self.max_entries = self.config.get('max_entries', 1000 * 1000)
+
     def connect(self, inputs, output):
         output = False
         super(DataFeed, self).connect(inputs, output)
@@ -773,11 +850,14 @@ class DataFeed(base.BaseFT):
     def read_checkpoint(self):
         self._connect_redis()
         self.last_checkpoint = self.SR.get(self.redis_skey_chkp)
-        self.SR.delete(self.redis_skey_chkp)
 
     def create_checkpoint(self, value):
         self._connect_redis()
         self.SR.set(self.redis_skey_chkp, value)
+
+    def remove_checkpoint(self):
+        self._connect_redis()
+        self.SR.delete(self.redis_skey_chkp)
 
     def _connect_redis(self):
         if self.SR is not None:
@@ -815,9 +895,15 @@ class DataFeed(base.BaseFT):
         self.SR.delete(self.redis_skey_value)
 
     def _add_indicator(self, score, indicator, value):
+        if self.length() >= self.max_entries:
+            LOG.info('dropped overflow')
+            self.statistics['drop.overflow'] += 1
+            return
+
         type_ = value['type']
         type_mapper = _TYPE_MAPPING.get(type_, None)
         if type_mapper is None:
+            self.statistics['drop.unknown_type'] += 1
             LOG.error('%s - Unsupported indicator type: %s', self.name, type_)
             return
 
@@ -825,7 +911,11 @@ class DataFeed(base.BaseFT):
         nsdict[self.namespaceuri] = self.namespace
         stix.utils.set_id_namespace(nsdict)
 
-        sp = stix.core.STIXPackage()
+        spid = '{}:indicator-{}'.format(
+            self.namespace,
+            uuid.uuid4()
+        )
+        sp = stix.core.STIXPackage(id_=spid)
 
         observables = type_mapper['mapper'](self.namespace, indicator, value)
 
@@ -835,11 +925,16 @@ class DataFeed(base.BaseFT):
                 uuid.uuid4()
             )
 
+            if value['type'] == 'URL':
+                eindicator = werkzeug.urls.iri_to_uri(indicator, safe_conversion=True)
+            else:
+                eindicator = indicator
+
             sindicator = stix.indicator.indicator.Indicator(
                 id_=id_,
                 title='{}: {}'.format(
                     value['type'],
-                    indicator
+                    eindicator
                 ),
                 description='{} indicator from {}'.format(
                     value['type'],
@@ -865,11 +960,12 @@ class DataFeed(base.BaseFT):
 
             sp.add_indicator(sindicator)
 
+        spackage = 'lz4'+lz4.compressHC(sp.to_json())
         with self.SR.pipeline() as p:
             p.multi()
 
-            p.zadd(self.redis_skey, score, id_)
-            p.hset(self.redis_skey_value, id_, sp.to_xml())
+            p.zadd(self.redis_skey, score, spid)
+            p.hset(self.redis_skey_value, spid, spackage)
 
             result = p.execute()[0]
 
@@ -942,3 +1038,41 @@ class DataFeed(base.BaseFT):
             self.name,
             self.SR.zcard(self.redis_skey)
         )
+
+    @staticmethod
+    def gc(name, config=None):
+        actorbase.ActorBaseFT.gc(name, config=config)
+
+        if config is None:
+            config = {}
+
+        redis_skey = name
+        redis_skey_value = '{}.value'.format(name)
+        redis_skey_chkp = '{}.chkp'.format(name)
+        redis_host = config.get('redis_host', '127.0.0.1')
+        redis_port = config.get('redis_port', 6379)
+        redis_password = config.get('redis_password', None)
+        redis_db = config.get('redis_db', 0)
+
+        cp = None
+        try:
+            cp = redis.ConnectionPool(
+                host=redis_host,
+                port=redis_port,
+                password=redis_password,
+                db=redis_db,
+                socket_timeout=10
+            )
+
+            SR = redis.StrictRedis(connection_pool=cp)
+
+            SR.delete(redis_skey)
+            SR.delete(redis_skey_value)
+            SR.delete(redis_skey_chkp)
+
+        except Exception as e:
+            raise RuntimeError(str(e))
+
+        finally:
+            if cp is not None:
+                cp.disconnect()

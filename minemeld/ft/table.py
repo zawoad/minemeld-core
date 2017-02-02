@@ -24,6 +24,8 @@ Numbers are 8-bit unsigned.
 - Index Last Global Id: (0,1, <indexnum>)
 - Last Update Key: (0,2)
 - Number of Indicators: (0,3)
+- Table Last Global ID: (0,4)
+- Custom Metadata: (0,5)
 - Indicator Version: (1,0,<indicator>)
 - Indicator: (1,1,<indicator>)
 
@@ -70,12 +72,14 @@ over the keys (2,<index id>,0xF0,<encoded value>) and
 (2,<index id>,0xF0,<encoded value>,0xFF..FF)
 """
 
+import os
 import plyvel
 import struct
 import ujson
 import time
 import logging
 import shutil
+import gevent
 
 
 SCHEMAVERSION_KEY = struct.pack("B", 0)
@@ -83,6 +87,8 @@ START_INDEX_KEY = struct.pack("BBB", 0, 1, 0)
 END_INDEX_KEY = struct.pack("BBB", 0, 1, 0xFF)
 LAST_UPDATE_KEY = struct.pack("BB", 0, 2)
 NUM_INDICATORS_KEY = struct.pack("BB", 0, 3)
+TABLE_LAST_GLOBAL_ID = struct.pack("BB", 0, 4)
+CUSTOM_METADATA = struct.pack("BB", 0, 5)
 
 LOG = logging.getLogger(__name__)
 
@@ -99,6 +105,9 @@ class Table(object):
             except:
                 pass
 
+        self.db = None
+        self._compact_glet = None
+
         self.db = plyvel.DB(
             name,
             create_if_missing=True,
@@ -106,15 +115,21 @@ class Table(object):
         )
         self._read_metadata()
 
+        self.compact_interval = int(os.environ.get('MM_TABLE_COMPACT_INTERVAL', 3600 * 6))
+        self.compact_delay = int(os.environ.get('MM_TABLE_COMPACT_DELAY', 3600))
+        self._compact_glet = gevent.spawn(self._compact_loop)
+
     def _init_db(self):
         self.last_update = 0
         self.indexes = {}
         self.num_indicators = 0
+        self.last_global_id = 0
 
         batch = self.db.write_batch()
-        batch.put(SCHEMAVERSION_KEY, struct.pack("B", 0))
+        batch.put(SCHEMAVERSION_KEY, struct.pack("B", 1))
         batch.put(LAST_UPDATE_KEY, struct.pack(">Q", self.last_update))
         batch.put(NUM_INDICATORS_KEY, struct.pack(">Q", self.num_indicators))
+        batch.put(TABLE_LAST_GLOBAL_ID, struct.pack(">Q", self.last_global_id))
         batch.write()
 
     def _read_metadata(self):
@@ -122,7 +137,12 @@ class Table(object):
         if sv is None:
             return self._init_db()
         sv = struct.unpack("B", sv)[0]
-        if sv != 0:
+        if sv == 0:
+            # add table last global id
+            self._upgrade_from_s0()
+        elif sv == 1:
+            pass
+        else:
             raise InvalidTableException("Schema version not supported")
 
         self.indexes = {}
@@ -130,14 +150,15 @@ class Table(object):
             start=START_INDEX_KEY,
             stop=END_INDEX_KEY
         )
-        for k, v in ri:
-            _, _, indexid = struct.unpack("BBB", k)
-            if v in self.indexes:
-                raise InvalidTableException("2 indexes with the same name")
-            self.indexes[v] = {
-                'id': indexid,
-                'last_global_id': 0
-            }
+        with ri:
+            for k, v in ri:
+                _, _, indexid = struct.unpack("BBB", k)
+                if v in self.indexes:
+                    raise InvalidTableException("2 indexes with the same name")
+                self.indexes[v] = {
+                    'id': indexid,
+                    'last_global_id': 0
+                }
         for i in self.indexes:
             lgi = self._get(self._last_global_id_key(self.indexes[i]['id']))
             if lgi is not None:
@@ -155,6 +176,11 @@ class Table(object):
             raise InvalidTableException("NUM_INDICATORS_KEY not found")
         self.num_indicators = struct.unpack(">Q", t)[0]
 
+        t = self._get(TABLE_LAST_GLOBAL_ID)
+        if t is None:
+            raise InvalidTableException("TABLE_LAST_GLOBAL_ID not found")
+        self.last_global_id = struct.unpack(">Q", t)[0]
+
     def _get(self, key):
         try:
             result = self.db.get(key)
@@ -163,8 +189,32 @@ class Table(object):
 
         return result
 
+    def __del__(self):
+        self.close()
+
+    def get_custom_metadata(self):
+        cmetadata = self._get(CUSTOM_METADATA)
+        if cmetadata is None:
+            return None
+        return ujson.loads(cmetadata)
+
+    def set_custom_metadata(self, metadata=None):
+        if metadata is None:
+            self.db.delete(CUSTOM_METADATA)
+            return
+
+        cmetadata = ujson.dumps(metadata)
+        self.db.put(CUSTOM_METADATA, cmetadata)
+
     def close(self):
-        self.db.close()
+        if self.db is not None:
+            self.db.close()
+
+        if self._compact_glet is not None:
+            self._compact_glet.kill()
+
+        self.db = None
+        self._compact_glet = None
 
     def exists(self, key):
         if type(key) == unicode:
@@ -258,19 +308,17 @@ class Table(object):
         ikeyv = self._indicator_key_version(key)
 
         exists = self._get(ikeyv)
-        if exists is not None:
-            cversion = struct.unpack(">Q", exists)[0]
-        else:
-            cversion = -1
+        self.last_global_id += 1
+        cversion = self.last_global_id
 
         now = time.time()
         self.last_update = now
-        cversion = cversion+1
 
         batch = self.db.write_batch()
         batch.put(ikey, struct.pack(">Q", cversion)+ujson.dumps(value))
         batch.put(ikeyv, struct.pack(">Q", cversion))
         batch.put(LAST_UPDATE_KEY, struct.pack(">Q", self.last_update))
+        batch.put(TABLE_LAST_GLOBAL_ID, struct.pack(">Q", self.last_global_id))
 
         if exists is None:
             self.num_indicators += 1
@@ -346,12 +394,13 @@ class Table(object):
             reverse=reverse,
             include_value=False
         )
-        for ekey in ri:
-            ekey = ekey[2:]
-            if include_value:
-                yield ekey, self.get(ekey)
-            else:
-                yield ekey
+        with ri:
+            for ekey in ri:
+                ekey = ekey[2:]
+                if include_value:
+                    yield ekey.decode('utf8', 'ignore'), self.get(ekey)
+                else:
+                    yield ekey.decode('utf8', 'ignore')
 
     def _query_by_index(self, index, from_key=None, to_key=None,
                         include_value=False, include_stop=True,
@@ -377,6 +426,7 @@ class Table(object):
                 lastidxid=0xFFFFFFFFFFFFFFFF
             )
 
+        ldeleted = 0
         ri = self.db.iterator(
             start=from_key,
             stop=to_key,
@@ -385,25 +435,108 @@ class Table(object):
             include_stop=include_stop,
             reverse=reverse
         )
-        for ikey, ekey in ri:
-            iversion = struct.unpack(">Q", ekey[:8])[0]
-            ekey = ekey[8:]
+        with ri:
+            for ikey, ekey in ri:
+                iversion = struct.unpack(">Q", ekey[:8])[0]
+                ekey = ekey[8:]
 
-            evalue = self._get(self._indicator_key_version(ekey))
-            if evalue is None:
-                # LOG.debug("Key does not exist")
-                # key does not exist
-                self.db.delete(ikey)
-                continue
+                evalue = self._get(self._indicator_key_version(ekey))
+                if evalue is None:
+                    # LOG.debug("Key does not exist")
+                    # key does not exist
+                    self.db.delete(ikey)
+                    ldeleted += 1
+                    continue
 
-            cversion = struct.unpack(">Q", evalue)[0]
-            if iversion != cversion:
-                # index value is old
-                # LOG.debug("Version mismatch")
-                self.db.delete(ikey)
-                continue
+                cversion = struct.unpack(">Q", evalue)[0]
+                if iversion != cversion:
+                    # index value is old
+                    # LOG.debug("Version mismatch")
+                    self.db.delete(ikey)
+                    ldeleted += 1
+                    continue
 
-            if include_value:
-                yield ekey, self.get(ekey)
+                if include_value:
+                    yield ekey.decode('utf8', 'ignore'), self.get(ekey)
+                else:
+                    yield ekey.decode('utf8', 'ignore')
+
+        LOG.info('Deleted in scan of {}: {}'.format(index, ldeleted))
+
+    def _compact_loop(self):
+        gevent.sleep(self.compact_delay)
+
+        while True:
+            try:
+                gevent.idle()
+
+                counter = 0
+                for idx in self.indexes.keys():
+                    for i in self.query(index=idx, include_value=False):
+                        if counter % 512 == 0:
+                            gevent.sleep(0.001)  # yield to other greenlets
+                        counter += 1
+
+            except gevent.GreenletExit:
+                break
+            except:
+                LOG.exception('Exception in _compact_loop')
+
+            try:
+                gevent.sleep(self.compact_interval)
+
+            except gevent.GreenletExit:
+                break
+
+    def _upgrade_from_s0(self):
+        LOG.info('Upgrading from schema version 0 to schema version 1')
+
+        LOG.info('Loading indexes...')
+        indexes = {}
+        ri = self.db.iterator(
+            start=START_INDEX_KEY,
+            stop=END_INDEX_KEY
+        )
+        with ri:
+            for k, v in ri:
+                _, _, indexid = struct.unpack("BBB", k)
+                if v in indexes:
+                    raise InvalidTableException("2 indexes with the same name")
+                indexes[v] = {
+                    'id': indexid,
+                    'last_global_id': 0
+                }
+        for i in indexes:
+            lgi = self._get(self._last_global_id_key(indexes[i]['id']))
+            if lgi is not None:
+                indexes[i]['last_global_id'] = struct.unpack(">Q", lgi)[0]
             else:
-                yield ekey
+                indexes[i]['last_global_id'] = -1
+
+        LOG.info('Scanning indexes...')
+        last_global_id = 0
+        for i, idata in indexes.iteritems():
+            from_key = struct.pack("BBB", 2, idata['id'], 0xF0)
+            include_start = False
+            to_key = struct.pack("BBB", 2, idata['id'], 0xF1)
+            include_stop = False
+
+            ri = self.db.iterator(
+                start=from_key,
+                stop=to_key,
+                include_value=True,
+                include_start=include_start,
+                include_stop=include_stop,
+                reverse=False
+            )
+            with ri:
+                for ikey, ekey in ri:
+                    iversion = struct.unpack(">Q", ekey[:8])[0]
+                    if iversion > last_global_id:
+                        last_global_id = iversion+1
+
+        LOG.info('Last global id: {}'.format(last_global_id))
+        batch = self.db.write_batch()
+        batch.put(SCHEMAVERSION_KEY, struct.pack("B", 1))
+        batch.put(TABLE_LAST_GLOBAL_ID, struct.pack(">Q", last_global_id))
+        batch.write()
